@@ -430,17 +430,27 @@ Be short and use bullet lists. Reply in the user's language (English, Urdu or Ro
 # ---------------------------------------------------------------------------
 # Chat loop
 # ---------------------------------------------------------------------------
-_client: Optional[OpenAI] = None
+_clients: dict[str, OpenAI] = {}
 
 
-def llm() -> OpenAI:
-    global _client
-    if _client is None:
-        key = os.getenv(KEY_ENV)
+def llm(provider: str = PROVIDER) -> OpenAI:
+    if provider not in _clients:
+        base, key_env, _ = PROVIDERS[provider]
+        key = os.getenv(key_env)
         if not key:
-            raise HTTPException(500, f"{KEY_ENV} is not set")
-        _client = OpenAI(api_key=key, base_url=BASE_URL)
-    return _client
+            raise HTTPException(500, f"{key_env} is not set")
+        _clients[provider] = OpenAI(api_key=key, base_url=base)
+    return _clients[provider]
+
+
+def candidates() -> list[tuple[str, str]]:
+    """(provider, model) pairs to try in order: the main provider's models, then the
+    other provider's models as a backup — but only if that provider's key is set."""
+    out = [(PROVIDER, m) for m in MODELS]
+    for name, (_, key_env, models) in PROVIDERS.items():
+        if name != PROVIDER and os.getenv(key_env):
+            out += [(name, m) for m in models]
+    return out
 
 
 def is_quota_error(e: Exception) -> bool:
@@ -448,22 +458,37 @@ def is_quota_error(e: Exception) -> bool:
     return getattr(e, "status_code", None) in (413, 429) or "rate_limit" in t or "RESOURCE_EXHAUSTED" in t
 
 
+def is_temporary_error(e: Exception) -> bool:
+    """Overloaded / unavailable / network trouble — worth trying another model."""
+    t = str(e)
+    code = getattr(e, "status_code", None)
+    return (code in (500, 502, 503, 504) or "UNAVAILABLE" in t or "overloaded" in t.lower()
+            or "high demand" in t or "timed out" in t.lower() or "Connection" in type(e).__name__)
+
+
 def call_llm(msgs: list[dict]):
-    """Try each model in order, skipping ones that recently hit their quota."""
+    """Try each model in order. Models that just hit a quota are skipped for 60s,
+    overloaded ones for 20s, so the next question goes straight to one that works."""
     now = time.time()
-    ready = [m for m in MODELS if _cooldown.get(m, 0) <= now] or MODELS
+    pairs = candidates()
+    ready = [c for c in pairs if _cooldown.get(c[1], 0) <= now] or pairs
     last: Optional[Exception] = None
-    for model in ready:
+    for provider, model in ready:
         try:
-            return llm().chat.completions.create(model=model, messages=msgs, tools=TOOLS, tool_choice="auto")
+            return llm(provider).chat.completions.create(
+                model=model, messages=msgs, tools=TOOLS, tool_choice="auto", timeout=40)
+        except HTTPException:
+            raise
         except Exception as e:
-            print(f"[llm] {model} failed: {str(e)[:400]}", flush=True)
+            print(f"[llm] {provider}:{model} failed: {str(e)[:300]}", flush=True)
             last = e
             if is_quota_error(e) or getattr(e, "status_code", None) == 404:
                 _cooldown[model] = now + COOLDOWN_SECONDS
-                continue  # try the next model
-            raise
-    raise last  # every model is out of quota
+            elif is_temporary_error(e):
+                _cooldown[model] = now + 20
+            else:
+                raise  # a real bug (bad request, bad key) — don't hide it
+    raise last
 
 
 def run_chat(message: str, history: list[dict]) -> str:
@@ -519,6 +544,8 @@ def chat(body: ChatIn):
     except HTTPException:
         raise
     except Exception as e:  # LLM errors: bad key, retired model, rate limit
+        if is_temporary_error(e):
+            raise HTTPException(503, "The AI service is busy right now — please try again in a minute.")
         if is_quota_error(e):
             daily = "per day" in str(e).lower() or "PerDay" in str(e)
             raise HTTPException(429, "Daily free limit reached for the AI model — please try again later."
